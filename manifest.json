@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "承曦 (for Mini)",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "homePage": "",
     "description": "把 Horae 壓縮好的歷史劇情摘要，交給你自選的 Sub API 整理成世界書條目，讓遠期劇情長存在 AI 眼前。不靠向量、手機友善。MVP：手動畢業＋預覽逐條確認。",
     "minimum_client_version": "1.18.0",

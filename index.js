@@ -9,9 +9,10 @@
  *   - 主流程：USER 框範圍 → Sub API 整理 → USER 逐條確認 → 才寫入
  *
  * 設計依據與已查證的 ST API（皆對照 _st_source / SillyTavern 1.18.0）：
- *   - getContext() 只暴露 loadWorldInfo / saveWorldInfo / createNewWorldInfo /
- *     updateWorldInfoList / reloadWorldInfoEditor / getWorldInfoNames；
- *     **createWorldInfoEntry 沒有暴露** → 本擴充自己手搓條目物件（不依賴未暴露的內部函式）。
+ *   - getContext() 只暴露 loadWorldInfo / saveWorldInfo / updateWorldInfoList /
+ *     reloadWorldInfoEditor / getWorldInfoNames / convertCharacterBook / getWorldInfoPrompt（st-context.js:276-282）；
+ *     **createWorldInfoEntry 與 createNewWorldInfo 都沒有暴露** → 條目自己手搓、建書改用
+ *     saveWorldInfo(name,{entries:{}},true)（見 ensureBookExists），不依賴未暴露的內部函式。
  *   - 旁路生成走官方 ConnectionManagerRequestService.sendRequest(profileId, prompt, maxTokens, custom)
  *     （shared.js:419；非串流回傳 { content }），走使用者選的「連線設定檔」、不污染聊天。
  *   - 連線設定檔清單在 extensionSettings.connectionManager.profiles（每個 { id, name, ... }）。
@@ -25,7 +26,7 @@
 
 /** 命名空間：同時是 extension_settings 的 key 與 DOM/CSS/slash 前綴 */
 const MODULE_NAME = 'hmg';
-const HMG_VERSION = '0.1.0';
+const HMG_VERSION = '0.1.1';
 const LOG = `[${MODULE_NAME}]`;
 
 /** ST 世界書條目範本（baked，對照 world-info.js:4002-4049 @1.18.0）。
@@ -147,7 +148,9 @@ function toast(type, msg, title = 'Horae→世界書', overrides = {}) {
 // 啟動能力檢測：缺了核心 context 函式就降級提示，不讓擴充靜默壞掉
 // ---------------------------------------------------------------------------
 
-const REQUIRED_CTX_FNS = ['loadWorldInfo', 'saveWorldInfo', 'createNewWorldInfo', 'getWorldInfoNames', 'saveSettingsDebounced'];
+// 注意：ST 1.18.0 的 getContext() 只暴露 load/save/reload/update/convert/getPrompt/getNames，
+// 沒有 createNewWorldInfo（建書改用 saveWorldInfo(name,{entries:{}},true)，見 ensureBookExists）。
+const REQUIRED_CTX_FNS = ['loadWorldInfo', 'saveWorldInfo', 'getWorldInfoNames', 'updateWorldInfoList', 'saveSettingsDebounced'];
 
 function checkCapabilities(ctx) {
     const missing = REQUIRED_CTX_FNS.filter((fn) => typeof ctx?.[fn] !== 'function');
@@ -402,40 +405,56 @@ async function ensureTargetBookSafe(bookName) {
 }
 
 /**
+ * 確保世界書存在；不存在就用 saveWorldInfo 建一本空的。
+ * ⚠️ getContext() 沒有暴露 createNewWorldInfo（ST 1.18.0 st-context.js:276-282），
+ * 而 createNewWorldInfo 內部本來就是 saveWorldInfo(name,{entries:{}},true)，故直接用後者等效且可用。
+ */
+async function ensureBookExists(ctx, bookName) {
+    const names = ctx.getWorldInfoNames?.() || [];
+    if (names.includes(bookName)) return;
+    await ctx.saveWorldInfo(bookName, { entries: {} }, true);
+    try { await ctx.updateWorldInfoList?.(); } catch { /* 清單刷新失敗不致命 */ }
+}
+
+/**
  * 批次 upsert 進目標世界書。items: [{ summary, entry:{title,content,keywords}, isConstant, order, background }]
- * 回傳 { created, updated }。
+ * 回傳 { created, updated, skipped }。skipped = 使用者手改過、為保護而跳過的條目。
  */
 async function writeEntries(bookName, items) {
     const ctx = getCtx();
     if (!bookName) throw new Error('尚未選擇目標世界書');
 
-    // 書不存在先建（新名不會跳覆蓋確認）
-    const names = ctx.getWorldInfoNames?.() || [];
-    if (!names.includes(bookName)) {
-        const created = await ctx.createNewWorldInfo(bookName);
-        if (created === false) throw new Error(`無法建立世界書「${bookName}」`);
-        try { await ctx.updateWorldInfoList?.(); } catch { /* 清單刷新失敗不致命 */ }
-    }
+    await ensureBookExists(ctx, bookName);
 
     let data = await ctx.loadWorldInfo(bookName);
     if (!data || typeof data !== 'object') throw new Error(`讀不到世界書「${bookName}」`);
     if (!data.entries || typeof data.entries !== 'object') data.entries = {};
 
     let created = 0, updated = 0;
+    const skipped = [];
     for (const item of items) {
         const summaryId = item.summary.id;
         const content = neutralizeMacros(item.entry.content);
         const comment = composeComment(item);
         const key = (item.entry.keywords || []).slice(0, 8);
-        const ignoreBudget = item.isConstant; // 藍燈常駐者保證進 prompt（走 ignoreBudget）
+        // 最終防線：無關鍵字的條目一律常駐，否則綠燈掃不到、藍燈又沒設＝永遠不觸發的死條目
+        //（涵蓋使用者在確認畫面把關鍵字清空的情況）。
+        const isConstant = item.isConstant || key.length === 0;
+        const ignoreBudget = isConstant; // 藍燈常駐者保證進 prompt（走 ignoreBudget）
 
         let e = findExistingEntry(data, summaryId);
         if (e) {
+            // 保護使用者手改：若上次寫入時記的 contentHash 與現在不符，代表使用者在世界書編輯器改過 → 跳過不覆蓋（PLAN §7）。
+            const prevHash = e.extensions?.hmg?.contentHash;
+            if (prevHash != null && prevHash !== stableHash(String(e.content ?? ''))) {
+                skipped.push(e.comment || summaryId);
+                continue;
+            }
             // 就地覆寫（保留 uid）。核心欄位一律重設為硬原則值，避免舊條目殘留錯設定（PLAN §3/§8）。
             e.content = content;
             e.comment = comment;
             e.key = key;
-            e.constant = item.isConstant;
+            e.constant = isConstant;
             e.vectorized = false;
             e.selective = true;
             e.position = 0;
@@ -453,7 +472,7 @@ async function writeEntries(bookName, items) {
             e.content = content;
             e.comment = comment;
             e.key = key;
-            e.constant = item.isConstant;
+            e.constant = isConstant;
             e.vectorized = false;     // 硬原則：不靠向量
             e.selective = true;
             e.position = 0;           // 背景區，與 Horae 末尾現況錯開
@@ -470,16 +489,18 @@ async function writeEntries(bookName, items) {
 
     await ctx.saveWorldInfo(bookName, data, true); // immediately=true，整批唯一落盤點
     try { await Promise.resolve(ctx.reloadWorldInfoEditor?.(bookName)); } catch { /* ignore */ }
-    return { created, updated };
+    return { created, updated, skipped };
 }
 
-/** 打上 hmg 標記（同時放 extensions.hmg 與頂層，哪個能 save→load 存活都行）。 */
+/** 打上 hmg 標記（同時放 extensions.hmg 與頂層，哪個能 save→load 存活都行）。
+ *  contentHash 記下「本擴充寫入當下的內容雜湊」，下次重跑用來偵測使用者是否手改過。 */
 function stampMarker(entry, summaryId, item) {
     entry.extensions = entry.extensions || {};
     entry.extensions.hmg = {
         source: 'horae',
         summaryId,
         version: HMG_VERSION,
+        contentHash: stableHash(String(entry.content ?? '')),
         storyDate: item.background?.storyDate || '',
         location: item.background?.location || '',
     };
@@ -537,11 +558,11 @@ async function runGraduateFlow() {
     const setProgress = (n) => { try { progressBody.text(`整理中 ${n}/${picked.length}…`); } catch { /* ignore */ } };
 
     const items = [];
-    let done = 0;
+    let done = 0, fallbackCount = 0;
     try {
         for (const summary of picked) {
             if (signal.aborted) break;
-            let entry;
+            let entry, fallback = false;
             if (useSubApi) {
                 try {
                     entry = await callSubApi(summary, s.connectionProfileId, signal);
@@ -549,11 +570,13 @@ async function runGraduateFlow() {
                     if (signal.aborted) break;
                     console.warn(LOG, 'Sub API 整理失敗，這條改用原文照搬：', err);
                     entry = passthroughEntry(summary);
+                    fallback = true;
+                    fallbackCount++;
                 }
             } else {
                 entry = passthroughEntry(summary);
             }
-            items.push({ summary, entry, background: summary.background });
+            items.push({ summary, entry, background: summary.background, fallback });
             setProgress(++done);
         }
     } finally {
@@ -562,12 +585,17 @@ async function runGraduateFlow() {
 
     if (signal.aborted) { toast('info', '已取消整理'); return; }
     if (!items.length) { toast('warning', '沒有可寫入的條目'); return; }
+    if (fallbackCount > 0) {
+        toast('warning', `有 ${fallbackCount} 條 Sub API 整理失敗，已改用原文照搬並設為藍燈常駐（仍會生效）。可在下一步確認畫面檢視。`);
+    }
 
-    // 標記藍燈：最新的 constantCount 條設常駐（省錢模式則全部常駐，因為沒有關鍵字可觸發）
+    // 標記藍燈：最新的 constantCount 條設常駐；另外——沒有關鍵字的條目（省錢模式 / Sub API 失敗 fallback /
+    // Sub API 沒抽到關鍵字）若不常駐就永遠掃不到，一律強制設藍燈常駐，避免寫出「永遠不觸發」的死條目。
     const constantCount = useSubApi ? Math.max(0, Number(s.constantCount) || 0) : items.length;
     items.forEach((it, i) => {
         const rankFromNewest = items.length - 1 - i; // 0 = 最新
-        it.isConstant = rankFromNewest < constantCount;
+        const noKeywords = !(it.entry.keywords && it.entry.keywords.length);
+        it.isConstant = (rankFromNewest < constantCount) || noKeywords;
         it.order = 100 + i; // 越舊 order 越小（預算溢出時先砍舊的）
     });
 
@@ -577,8 +605,12 @@ async function runGraduateFlow() {
 
     // 步驟四：寫入
     try {
-        const { created, updated } = await writeEntries(s.targetBook, confirmed);
-        toast('success', `已寫入世界書「${s.targetBook}」：新增 ${created} 條、更新 ${updated} 條。`);
+        const { created, updated, skipped } = await writeEntries(s.targetBook, confirmed);
+        let msg = `已寫入世界書「${s.targetBook}」：新增 ${created} 條、更新 ${updated} 條。`;
+        if (skipped && skipped.length) {
+            msg += ` 另有 ${skipped.length} 條因為你手動改過、為避免蓋掉而跳過。`;
+        }
+        toast('success', msg);
         refreshBookSelect();
     } catch (err) {
         console.error(LOG, '寫入失敗：', err);
@@ -905,8 +937,7 @@ function bindPanel() {
         const name = await ctx.callGenericPopup('新世界書的名稱：', ctx.POPUP_TYPE.INPUT, '');
         if (typeof name !== 'string' || !name.trim()) return;
         try {
-            await ctx.createNewWorldInfo(name.trim());
-            await ctx.updateWorldInfoList?.();
+            await ensureBookExists(ctx, name.trim());
             getSettings().targetBook = name.trim(); saveSettings();
             refreshBookSelect();
             toast('success', `已新建世界書「${name.trim()}」並設為目標`);
@@ -916,7 +947,13 @@ function bindPanel() {
     const numBind = (id, key) => {
         const el = document.getElementById(`${MODULE_NAME}_${id}`);
         el.value = s[key];
-        el.addEventListener('change', () => { getSettings()[key] = Number(el.value) || defaultSettings[key]; saveSettings(); });
+        el.addEventListener('change', () => {
+            // 用 isFinite 判斷，讓合法的 0 能保存（不要用 Number(x)||default，那會把 0 改回預設）
+            const n = Number(el.value);
+            getSettings()[key] = Number.isFinite(n) && n >= 0 ? n : defaultSettings[key];
+            el.value = getSettings()[key]; // 非法輸入時把 UI 拉回有效值
+            saveSettings();
+        });
     };
     numBind('oldestN', 'oldestN');
     numBind('maxEntries', 'maxEntries');
