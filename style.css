@@ -1,0 +1,147 @@
+/*
+ * Horae 記憶畢業到世界書 — 樣式
+ *
+ * 原則（對照 Kit 10-css-theming-mobile.md）：
+ * 1. 能用 ST 共用 class（text_pole / menu_button / checkbox_label / inline-drawer）就不自己造。
+ * 2. 所有 selector 鎖在 #hmg_settings 或 .hmg-popup 底下，不污染全域。
+ * 3. 顏色一律用主題變數（--SmartTheme*），主題切換自動跟著變。
+ * 4. 行動優先：流式排版、不用 position:fixed+bottom；彈窗交給 ST Popup 的 <dialog> top layer。
+ */
+
+/* ---- 設定面板 ---- */
+#hmg_settings .inline-drawer-content > label,
+#hmg_settings .inline-drawer-content > select,
+#hmg_settings .inline-drawer-content > input {
+    margin-bottom: 5px;
+}
+
+#hmg_settings .hmg-hint {
+    display: block;
+    margin: 2px 0 8px;
+    opacity: 0.7;
+    overflow-wrap: anywhere;
+}
+
+#hmg_settings .hmg-inline {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+#hmg_settings .hmg-inline select {
+    flex: 1;
+    min-width: 120px;
+}
+
+#hmg_settings .hmg-grid {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+}
+
+#hmg_settings .hmg-grid > div {
+    flex: 1;
+    min-width: 90px;
+}
+
+#hmg_settings .hmg-grid input {
+    width: 100%;
+}
+
+#hmg_settings .hmg-status {
+    margin-top: 8px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.8;
+    overflow-wrap: anywhere;
+}
+
+/* ---- 彈窗（畢業預覽 / 逐條確認）---- */
+.hmg-popup {
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.hmg-popup .hmg-intro {
+    font-weight: bold;
+    overflow-wrap: anywhere;
+}
+
+.hmg-popup .hmg-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* 選摘要的列 */
+.hmg-popup .hmg-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.hmg-popup .hmg-row-body {
+    flex: 1;
+    min-width: 0;
+}
+
+.hmg-popup .hmg-row-head {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    color: var(--SmartThemeQuoteColor);
+    overflow-wrap: anywhere;
+}
+
+.hmg-popup .hmg-row-prev {
+    margin-top: 3px;
+    opacity: 0.85;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+/* 逐條確認的卡片 */
+.hmg-popup .hmg-card {
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.hmg-popup .hmg-card-top {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    cursor: pointer;
+}
+
+.hmg-popup .hmg-badge {
+    font-size: calc(var(--mainFontSize) * 0.8);
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    opacity: 0.85;
+}
+
+.hmg-popup .hmg-flabel {
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
+    margin-top: 2px;
+}
+
+.hmg-popup .hmg-card textarea.hmg-content {
+    width: 100%;
+    resize: vertical;
+}
+
+.hmg-popup .hmg-card input.hmg-title,
+.hmg-popup .hmg-card input.hmg-keys {
+    width: 100%;
+}
