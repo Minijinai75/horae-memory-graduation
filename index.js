@@ -1,8 +1,7 @@
 /**
- * Horae 記憶畢業到世界書 — 橋接擴充（MVP / v0.1.0）
+ * Horae 記憶畢業到世界書 — 橋接擴充（v0.2.0）
  *
- * 它做一件事：把 Horae 已壓縮好的「歷史劇情摘要」（chat[0].horae_meta.autoSummaries），
- * 交給你在面板自選的 Sub API 重寫成通順、好觸發的世界書條目，讓遠期劇情長存在 AI 眼前。
+ * 把 Horae 的重要／關鍵事件與永久資料整理成世界書條目；autoSummaries 有就作壓縮層，沒有也能運作。
  *   - 不靠向量（vectorized=false）、手機友善
  *   - 注入位置 position=0（背景區），與 Horae 末尾的「現況」注入錯開
  *   - 只讀 Horae，從不寫 Horae
@@ -11,8 +10,8 @@
  * 設計依據與已查證的 ST API（皆對照 _st_source / SillyTavern 1.18.0）：
  *   - getContext() 只暴露 loadWorldInfo / saveWorldInfo / updateWorldInfoList /
  *     reloadWorldInfoEditor / getWorldInfoNames / convertCharacterBook / getWorldInfoPrompt（st-context.js:276-282）；
- *     **createWorldInfoEntry 與 createNewWorldInfo 都沒有暴露** → 條目自己手搓、建書改用
- *     saveWorldInfo(name,{entries:{}},true)（見 ensureBookExists），不依賴未暴露的內部函式。
+ *     **createWorldInfoEntry 與 createNewWorldInfo 都沒有暴露** → 條目自己手搓；安全建書時明確
+ *     import 核心 getSanitizedFilename/createNewWorldInfo，保留檔名清理與撞名確認（見 createBookSafely）。
  *   - 旁路生成走官方 ConnectionManagerRequestService.sendRequest(profileId, prompt, maxTokens, custom)
  *     （shared.js:419；非串流回傳 { content }），走使用者選的「連線設定檔」、不污染聊天。
  *   - 連線設定檔清單在 extensionSettings.connectionManager.profiles（每個 { id, name, ... }）。
@@ -24,9 +23,21 @@
 
 'use strict';
 
+import {
+    countHoraeCandidateTypes,
+    classifyCandidateAgainstEntries,
+    entryFingerprint,
+    extractHoraeCandidates,
+    normalizeIntegerSetting,
+    normalizeIntegerSettings,
+    rebalanceHmgConstants,
+    shouldProtectExistingEntry,
+    stableHash,
+} from './helpers.js';
+
 /** 命名空間：同時是 extension_settings 的 key 與 DOM/CSS/slash 前綴 */
 const MODULE_NAME = 'hmg';
-const HMG_VERSION = '0.1.1';
+const HMG_VERSION = '0.2.0';
 const LOG = `[${MODULE_NAME}]`;
 
 /** ST 世界書條目範本（baked，對照 world-info.js:4002-4049 @1.18.0）。
@@ -77,13 +88,25 @@ const WI_ENTRY_TEMPLATE = Object.freeze({
 /** 預設設定（逐 key 補洞，不覆蓋使用者既有值） */
 const defaultSettings = Object.freeze({
     enabled: true,
-    subApiEnabled: true,        // 關 = 省錢模式（原文照搬、無關鍵字、強制藍燈常駐）
+    subApiEnabled: true,        // 關 = 省錢模式（原文照搬，沿用 Horae 人名／地點等基礎關鍵字）
     connectionProfileId: '',    // 選用的連線設定檔 id（旁路生成用）
     targetBook: '',             // 目標世界書名
-    oldestN: 5,                 // 預覽預設勾選「最舊的 N 條」
+    oldestN: 5,                 // 預覽預設勾選排序最前的 N 條
     maxEntries: 12,             // 單次寫入硬上限
+    maxTotalEntries: 60,        // 目標世界書內 hmg 條目總上限
+    minEventDistance: 0,        // 歷史事件距聊天底部至少 N 樓；0 = 手動流程不限制
     constantCount: 1,           // 最新 N 條設藍燈常駐（其餘靠關鍵字綠燈）
     subApiMaxTokens: 800,       // 每條整理的回應上限
+});
+
+/** 數值設定唯一上下界來源：UI、舊設定 migration、主流程共用。 */
+const integerSettingBounds = Object.freeze({
+    oldestN: Object.freeze({ min: 0, max: 50 }),
+    maxEntries: Object.freeze({ min: 1, max: 50 }),
+    maxTotalEntries: Object.freeze({ min: 10, max: 300 }),
+    minEventDistance: Object.freeze({ min: 0, max: 1000 }),
+    constantCount: Object.freeze({ min: 0, max: 10 }),
+    subApiMaxTokens: Object.freeze({ min: 64, max: 8192 }),
 });
 
 // ---------------------------------------------------------------------------
@@ -109,6 +132,10 @@ function getSettings() {
     for (const [k, v] of Object.entries(defaultSettings)) {
         if (s[k] === undefined) s[k] = v;
     }
+    // v0.1.1 只檢查非負，可能留下小數或超上限值；載入時修正一次，避免直接觸發大量 API 請求。
+    if (normalizeIntegerSettings(s, defaultSettings, integerSettingBounds)) {
+        try { ctx.saveSettingsDebounced(); } catch { /* ignore */ }
+    }
     return s;
 }
 
@@ -129,16 +156,6 @@ function neutralizeMacros(s) {
     return String(s ?? '').replace(/\{\{/g, `{${z}{`).replace(/\}\}/g, `}${z}}`);
 }
 
-/** 內容穩定雜湊（base36），給沒有 id 的摘要當去重鍵——不依賴會變動的樓層位置。 */
-function stableHash(str) {
-    let h = 0;
-    const s = String(str ?? '');
-    for (let i = 0; i < s.length; i++) {
-        h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
-    }
-    return (h >>> 0).toString(36);
-}
-
 function toast(type, msg, title = 'Horae→世界書', overrides = {}) {
     try { globalThis.toastr?.[type]?.(msg, title, { timeOut: type === 'error' ? 6000 : 3500, ...overrides }); }
     catch { /* ignore */ }
@@ -148,9 +165,9 @@ function toast(type, msg, title = 'Horae→世界書', overrides = {}) {
 // 啟動能力檢測：缺了核心 context 函式就降級提示，不讓擴充靜默壞掉
 // ---------------------------------------------------------------------------
 
-// 注意：ST 1.18.0 的 getContext() 只暴露 load/save/reload/update/convert/getPrompt/getNames，
-// 沒有 createNewWorldInfo（建書改用 saveWorldInfo(name,{entries:{}},true)，見 ensureBookExists）。
-const REQUIRED_CTX_FNS = ['loadWorldInfo', 'saveWorldInfo', 'getWorldInfoNames', 'updateWorldInfoList', 'saveSettingsDebounced'];
+// 注意：ST 1.18.0 的 getContext() 只暴露 load/save/reload/update/convert/getPrompt/getNames；
+// createNewWorldInfo 由 createBookSafely 明確 import 核心 module，不能假裝是 context 成員。
+const REQUIRED_CTX_FNS = ['loadWorldInfo', 'saveWorldInfo', 'getWorldInfoNames', 'saveSettingsDebounced'];
 
 function checkCapabilities(ctx) {
     const missing = REQUIRED_CTX_FNS.filter((fn) => typeof ctx?.[fn] !== 'function');
@@ -159,7 +176,7 @@ function checkCapabilities(ctx) {
 
 function horaeAvailable() {
     const ctx = getCtx();
-    if (ctx?.chat?.[0]?.horae_meta) return true;
+    if (Array.isArray(ctx?.chat) && ctx.chat.some((message) => message?.horae_meta)) return true;
     return !!(globalThis.Horae && typeof globalThis.Horae.getChat === 'function');
 }
 
@@ -167,78 +184,29 @@ function horaeAvailable() {
 // Horae 讀取（只讀，不寫）
 // ---------------------------------------------------------------------------
 
-/** 拿到目前聊天的 horae_meta（路徑 A 為主、window.Horae 為備援，兩者同源）。 */
-function getHoraeMeta() {
+/** 拿到目前聊天（SillyTavern context 為主、Horae 公開 API 為備援）。 */
+function getHoraeChat() {
     const ctx = getCtx();
-    const fromChat = ctx?.chat?.[0]?.horae_meta;
-    if (fromChat) return fromChat;
+    if (Array.isArray(ctx?.chat) && ctx.chat.length) return ctx.chat;
     try {
         const horaeChat = globalThis.Horae?.getChat?.();
-        return horaeChat?.[0]?.horae_meta ?? null;
+        return Array.isArray(horaeChat) ? horaeChat : [];
     } catch {
-        return null;
+        return [];
     }
 }
 
-/** 取得 autoSummaries（active!==false），附上每條的背景與覆蓋位置，oldest 先。 */
+/**
+ * 取得所有可畢業候選。事件是基礎來源，autoSummaries 只是可選壓縮層；
+ * 永久場景與聚合角色／重要物品也由 pure extraction layer 統一產生。
+ */
 function getGraduatableSummaries() {
-    const meta = getHoraeMeta();
-    const list = Array.isArray(meta?.autoSummaries) ? meta.autoSummaries : [];
-    const ctx = getCtx();
-    const chatLen = Array.isArray(ctx?.chat) ? ctx.chat.length : 0;
-
-    const out = [];
-    for (const s of list) {
-        if (!s || s.active === false) continue;
-        const text = typeof s.summaryText === 'string' ? s.summaryText.trim() : '';
-        if (!text) continue; // 沒有摘要文字的（極舊未遷移資料）先跳過
-        const covered = Array.isArray(s.coveredIndices) && s.coveredIndices.length
-            ? s.coveredIndices.slice()
-            : (Array.isArray(s.range) && s.range.length === 2
-                ? rangeToIndices(s.range)
-                : []);
-        const maxIdx = covered.length ? Math.max(...covered) : -1;
-        // 去重鍵優先用 Horae 穩定 id；缺 id 時用「內容雜湊」當鍵（不綁樓層位置，避免位置變動產生重複）
-        const id = s.id != null && s.id !== '' ? String(s.id) : `hmgh_${stableHash(text)}`;
-        out.push({
-            id,
-            summaryText: text,
-            covered,
-            maxIdx,
-            distanceFromBottom: maxIdx >= 0 ? Math.max(0, chatLen - 1 - maxIdx) : Infinity,
-            background: getSummaryBackground(covered),
-        });
-    }
-    // oldest（覆蓋位置越小越舊）先
-    out.sort((a, b) => a.maxIdx - b.maxIdx);
-    return out;
-}
-
-function rangeToIndices([a, b]) {
-    if (!Number.isInteger(a) || !Number.isInteger(b)) return [];
-    const lo = Math.min(a, b), hi = Math.max(a, b);
-    const arr = [];
-    for (let i = lo; i <= hi; i++) arr.push(i);
-    return arr;
-}
-
-/** 從覆蓋樓層的 horae_meta 取背景（時間/地點/在場角色）。一律讀樓層 meta，不讀可能被改寫的 events。 */
-function getSummaryBackground(covered) {
-    const ctx = getCtx();
-    const chat = ctx?.chat;
-    const bg = { storyDate: '', storyTime: '', location: '', characters: [] };
-    if (!Array.isArray(chat) || !covered.length) return bg;
-    // 取覆蓋範圍內「最後一個有 meta 的樓層」當代表背景
-    for (let i = covered.length - 1; i >= 0; i--) {
-        const m = chat[covered[i]]?.horae_meta;
-        if (!m) continue;
-        bg.storyDate = m.timestamp?.story_date || bg.storyDate;
-        bg.storyTime = m.timestamp?.story_time || bg.storyTime;
-        bg.location = m.scene?.location || bg.location;
-        if (Array.isArray(m.scene?.characters_present)) bg.characters = m.scene.characters_present.slice();
-        if (bg.location || bg.storyDate) break;
-    }
-    return bg;
+    const chat = getHoraeChat();
+    let latestState = null;
+    try { latestState = globalThis.Horae?.getLatestState?.() ?? null; } catch { /* raw chat fallback */ }
+    const minDistance = getSettings().minEventDistance;
+    return extractHoraeCandidates(chat, latestState).filter((candidate) =>
+        candidate.maxIdx < 0 || candidate.distanceFromBottom >= minDistance);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +222,10 @@ function getConnectionProfiles() {
 /** 組整理 prompt：餵 summaryText + 背景，要回嚴格 JSON {title, content, keywords[]}。 */
 function buildSubApiPrompt(summary) {
     const bg = summary.background || {};
+    const typeNames = {
+        event: '重要劇情事件', summary: '壓縮後歷史摘要', location: '永久場景資料',
+        character: '角色長期資料', item: '重要物品資料', relationship: '角色關係資料',
+    };
     const bgLines = [];
     if (bg.storyDate || bg.storyTime) bgLines.push(`故事時間：${[bg.storyDate, bg.storyTime].filter(Boolean).join(' ')}`);
     if (bg.location) bgLines.push(`地點：${bg.location}`);
@@ -261,7 +233,7 @@ function buildSubApiPrompt(summary) {
     const bgBlock = bgLines.length ? `\n【背景】\n${bgLines.join('\n')}\n` : '\n';
 
     return [
-        '你是一個負責整理長期記憶的編輯。下面是一段角色扮演的歷史劇情摘要。',
+        `你是一個負責整理長期記憶的編輯。下面是一筆角色扮演的「${typeNames[summary.type] || '長期記憶'}」。`,
         '請把它改寫成一則「世界書條目」，讓 AI 日後能回想起這段遠期劇情。',
         '要求：',
         '1. content：用過去式、第三人稱客觀敘述，通順精煉，保留關鍵人事物與因果，不要加入摘要裡沒有的內容。',
@@ -270,7 +242,7 @@ function buildSubApiPrompt(summary) {
         '只輸出 JSON，不要任何額外文字，格式嚴格如下：',
         '{"title":"...","content":"...","keywords":["...","..."]}',
         bgBlock,
-        '【歷史劇情摘要】',
+        '【來源資料】',
         summary.summaryText,
     ].join('\n');
 }
@@ -364,8 +336,9 @@ function freeUid(data) {
 /** 人話標題：時光記憶｜故事日期 @地點｜一句話標題 */
 function composeComment(item) {
     const bg = item.background || {};
+    const typeNames = { event: '事件', summary: '摘要', location: '場景', character: '角色', item: '物品', relationship: '關係' };
     const when = [bg.storyDate, bg.storyTime].filter(Boolean).join(' ');
-    const head = ['時光記憶', when, bg.location ? `@${bg.location}` : ''].filter(Boolean).join('｜');
+    const head = ['時光記憶', typeNames[item.summary?.type] || '', when, bg.location ? `@${bg.location}` : ''].filter(Boolean).join('｜');
     const t = item.entry.title ? item.entry.title.replace(/\s+/g, ' ').slice(0, 30) : '';
     return t ? `${head}｜${t}` : head;
 }
@@ -404,16 +377,43 @@ async function ensureTargetBookSafe(bookName) {
     }
 }
 
-/**
- * 確保世界書存在；不存在就用 saveWorldInfo 建一本空的。
- * ⚠️ getContext() 沒有暴露 createNewWorldInfo（ST 1.18.0 st-context.js:276-282），
- * 而 createNewWorldInfo 內部本來就是 saveWorldInfo(name,{entries:{}},true)，故直接用後者等效且可用。
- */
-async function ensureBookExists(ctx, bookName) {
-    const names = ctx.getWorldInfoNames?.() || [];
-    if (names.includes(bookName)) return;
-    await ctx.saveWorldInfo(bookName, { entries: {} }, true);
-    try { await ctx.updateWorldInfoList?.(); } catch { /* 清單刷新失敗不致命 */ }
+/** 用核心完整流程安全建書，回傳實際（已清理）書名；取消時回 null。 */
+async function createBookSafely(requestedName) {
+    const [{ createNewWorldInfo }, { getSanitizedFilename }] = await Promise.all([
+        import('/scripts/world-info.js'),
+        import('/scripts/utils.js'),
+    ]);
+    const bookName = String(await getSanitizedFilename(requestedName)).trim();
+    if (!bookName) throw new Error('世界書名稱清理後為空，請換一個名稱');
+    const created = await createNewWorldInfo(bookName, { interactive: true });
+    return created ? bookName : null;
+}
+
+function deleteExistingEntry(data, summaryId) {
+    for (const uid of Object.keys(data.entries || {})) {
+        const entry = data.entries[uid];
+        if (entry?.extensions?.hmg?.summaryId === summaryId || entry?.hmg_summary_id === summaryId) {
+            delete data.entries[uid];
+            return true;
+        }
+    }
+    return false;
+}
+
+/** 在花 Sub API 費用前先排除來源未變與受人工修改保護的條目。 */
+async function filterExistingCandidates(bookName, candidates) {
+    const ctx = getCtx();
+    const data = await ctx.loadWorldInfo(bookName);
+    if (!data || typeof data !== 'object') throw new Error(`讀不到世界書「${bookName}」`);
+    const ready = [];
+    let unchanged = 0, protectedCount = 0;
+    for (const candidate of candidates) {
+        const { status } = classifyCandidateAgainstEntries(data.entries, candidate);
+        if (status === 'new' || status === 'update' || status === 'delete') ready.push(candidate);
+        else if (status === 'protected') protectedCount++;
+        else unchanged++;
+    }
+    return { ready, unchanged, protectedCount };
 }
 
 /**
@@ -424,29 +424,48 @@ async function writeEntries(bookName, items) {
     const ctx = getCtx();
     if (!bookName) throw new Error('尚未選擇目標世界書');
 
-    await ensureBookExists(ctx, bookName);
+    // 寫入流程不隱式建書：目標若被刪除或是舊版留下的未清理名稱，要求使用者重新選擇，避免空檔覆蓋撞名書籍。
+    const names = ctx.getWorldInfoNames?.() || [];
+    if (!names.includes(bookName)) throw new Error(`目標世界書「${bookName}」不存在，請重新選擇或安全新建`);
 
     let data = await ctx.loadWorldInfo(bookName);
     if (!data || typeof data !== 'object') throw new Error(`讀不到世界書「${bookName}」`);
     if (!data.entries || typeof data.entries !== 'object') data.entries = {};
 
-    let created = 0, updated = 0;
+    const existingHmgCount = Object.values(data.entries).filter((entry) =>
+        entry?.extensions?.hmg?.summaryId || entry?.hmg_summary_id).length;
+    const newCount = items.filter((item) => item.summary.action !== 'delete' && !findExistingEntry(data, item.summary.id)).length;
+    const totalLimit = getSettings().maxTotalEntries;
+    if (existingHmgCount + newCount > totalLimit) {
+        throw new Error(`寫入後會有 ${existingHmgCount + newCount} 條 hmg 記憶，超過全書上限 ${totalLimit}；請減少勾選或調高上限`);
+    }
+
+    let created = 0, updated = 0, deleted = 0;
     const skipped = [];
     for (const item of items) {
         const summaryId = item.summary.id;
+        if (item.summary.action === 'delete') {
+            const existing = findExistingEntry(data, summaryId);
+            if (!existing) continue;
+            if (shouldProtectExistingEntry(existing)) {
+                skipped.push(existing.comment || summaryId);
+                continue;
+            }
+            if (deleteExistingEntry(data, summaryId)) deleted++;
+            continue;
+        }
         const content = neutralizeMacros(item.entry.content);
         const comment = composeComment(item);
         const key = (item.entry.keywords || []).slice(0, 8);
         // 最終防線：無關鍵字的條目一律常駐，否則綠燈掃不到、藍燈又沒設＝永遠不觸發的死條目
         //（涵蓋使用者在確認畫面把關鍵字清空的情況）。
         const isConstant = item.isConstant || key.length === 0;
-        const ignoreBudget = isConstant; // 藍燈常駐者保證進 prompt（走 ignoreBudget）
+        const ignoreBudget = isConstant && key.length > 0;
 
         let e = findExistingEntry(data, summaryId);
         if (e) {
-            // 保護使用者手改：若上次寫入時記的 contentHash 與現在不符，代表使用者在世界書編輯器改過 → 跳過不覆蓋（PLAN §7）。
-            const prevHash = e.extensions?.hmg?.contentHash;
-            if (prevHash != null && prevHash !== stableHash(String(e.content ?? ''))) {
+            // 完整保護 content/comment/key；舊版缺 entryHash 時也保守跳過，避免把「無法判斷」當成「未手改」。
+            if (shouldProtectExistingEntry(e)) {
                 skipped.push(e.comment || summaryId);
                 continue;
             }
@@ -487,13 +506,16 @@ async function writeEntries(bookName, items) {
         }
     }
 
+    // 每批寫入後全域重整，避免每跑一批就多留一批 constant/ignoreBudget。
+    rebalanceHmgConstants(data.entries, getSettings().constantCount);
+
     await ctx.saveWorldInfo(bookName, data, true); // immediately=true，整批唯一落盤點
     try { await Promise.resolve(ctx.reloadWorldInfoEditor?.(bookName)); } catch { /* ignore */ }
-    return { created, updated, skipped };
+    return { created, updated, deleted, skipped };
 }
 
 /** 打上 hmg 標記（同時放 extensions.hmg 與頂層，哪個能 save→load 存活都行）。
- *  contentHash 記下「本擴充寫入當下的內容雜湊」，下次重跑用來偵測使用者是否手改過。 */
+ *  entryHash 涵蓋 content/comment/key，供下次重跑偵測人工修改；contentHash 留作舊版相容資訊。 */
 function stampMarker(entry, summaryId, item) {
     entry.extensions = entry.extensions || {};
     entry.extensions.hmg = {
@@ -501,6 +523,11 @@ function stampMarker(entry, summaryId, item) {
         summaryId,
         version: HMG_VERSION,
         contentHash: stableHash(String(entry.content ?? '')),
+        entryHash: entryFingerprint(entry),
+        sourceOrder: Number.isFinite(Number(item.summary?.sourceOrder)) ? Number(item.summary.sourceOrder) : -1,
+        sourceHash: item.summary?.sourceHash || '',
+        sourceType: item.summary?.type || 'summary',
+        entityKey: item.summary?.entityKey || '',
         storyDate: item.background?.storyDate || '',
         location: item.background?.location || '',
     };
@@ -521,13 +548,13 @@ async function runGraduateFlow() {
     if (!s.enabled) { toast('warning', '本擴充目前是停用狀態（面板可開啟）'); return; }
 
     if (!horaeAvailable()) {
-        toast('warning', '這個聊天讀不到 Horae 記憶（chat[0].horae_meta）。請在有跑 Horae 的聊天裡使用。');
+        toast('warning', '這個聊天讀不到任何 Horae 記憶。請在有跑 Horae 的聊天裡使用。');
         return;
     }
 
     const summaries = getGraduatableSummaries();
     if (!summaries.length) {
-        toast('info', '目前沒有可畢業的 Horae 摘要（autoSummaries）。等 Horae 累積出歷史摘要後再來。');
+        toast('info', '目前沒有可畢業的 Horae 重要事件或永久資料。這不要求開啟自動摘要。');
         return;
     }
 
@@ -535,8 +562,24 @@ async function runGraduateFlow() {
     if (!s.targetBook) { toast('warning', '請先在面板選一本目標世界書（或按 ＋ 新建一本）。'); return; }
     if (!(await ensureTargetBookSafe(s.targetBook))) return;
 
-    // 步驟一：選擇要畢業哪些（預設勾最舊的 N 條、上限 maxEntries）
-    const picked = await pickSummariesPopup(summaries, s);
+    let candidates = summaries;
+    try {
+        const filtered = await filterExistingCandidates(s.targetBook, summaries);
+        candidates = filtered.ready;
+        if (filtered.unchanged || filtered.protectedCount) {
+            toast('info', `已略過 ${filtered.unchanged} 筆來源未變、${filtered.protectedCount} 筆受人工修改保護的記憶，不會重複呼叫 Sub API。`);
+        }
+    } catch (err) {
+        toast('error', `預檢目標世界書失敗：${err?.message || err}`);
+        return;
+    }
+    if (!candidates.length) {
+        toast('info', '可畢業資料都已是最新或受人工修改保護，這次不需處理。');
+        return;
+    }
+
+    // 步驟一：選擇要畢業哪些（歷史事件排前、永久實體排後；上限 maxEntries）
+    const picked = await pickSummariesPopup(candidates, s);
     if (!picked || !picked.length) return;
 
     // 步驟二：整理（Sub API 開啟且有設定檔才走整理，否則省錢模式原文照搬）
@@ -563,9 +606,14 @@ async function runGraduateFlow() {
         for (const summary of picked) {
             if (signal.aborted) break;
             let entry, fallback = false;
-            if (useSubApi) {
+            if (summary.action === 'delete') {
+                entry = { title: `刪除 ${summary.entityKey}`, content: summary.summaryText, keywords: summary.defaultKeywords || [] };
+            } else if (useSubApi) {
                 try {
                     entry = await callSubApi(summary, s.connectionProfileId, signal);
+                    if (!entry.keywords?.length && summary.defaultKeywords?.length) {
+                        entry.keywords = summary.defaultKeywords.slice(0, 8);
+                    }
                 } catch (err) {
                     if (signal.aborted) break;
                     console.warn(LOG, 'Sub API 整理失敗，這條改用原文照搬：', err);
@@ -586,11 +634,11 @@ async function runGraduateFlow() {
     if (signal.aborted) { toast('info', '已取消整理'); return; }
     if (!items.length) { toast('warning', '沒有可寫入的條目'); return; }
     if (fallbackCount > 0) {
-        toast('warning', `有 ${fallbackCount} 條 Sub API 整理失敗，已改用原文照搬並設為藍燈常駐（仍會生效）。可在下一步確認畫面檢視。`);
+        toast('warning', `有 ${fallbackCount} 條 Sub API 整理失敗，已改用原文照搬與 Horae 基礎關鍵字。可在下一步確認畫面檢視。`);
     }
 
-    // 標記藍燈：最新的 constantCount 條設常駐；另外——沒有關鍵字的條目（省錢模式 / Sub API 失敗 fallback /
-    // Sub API 沒抽到關鍵字）若不常駐就永遠掃不到，一律強制設藍燈常駐，避免寫出「永遠不觸發」的死條目。
+    // 標記藍燈：最新的 constantCount 條設常駐；沒有關鍵字的條目若不常駐就永遠掃不到，
+    // 因此仍設 constant，但不讓它們無上限 ignoreBudget。
     const constantCount = useSubApi ? Math.max(0, Number(s.constantCount) || 0) : items.length;
     items.forEach((it, i) => {
         const rankFromNewest = items.length - 1 - i; // 0 = 最新
@@ -605,10 +653,10 @@ async function runGraduateFlow() {
 
     // 步驟四：寫入
     try {
-        const { created, updated, skipped } = await writeEntries(s.targetBook, confirmed);
-        let msg = `已寫入世界書「${s.targetBook}」：新增 ${created} 條、更新 ${updated} 條。`;
+        const { created, updated, deleted, skipped } = await writeEntries(s.targetBook, confirmed);
+        let msg = `已寫入世界書「${s.targetBook}」：新增 ${created} 條、更新 ${updated} 條、刪除 ${deleted} 條。`;
         if (skipped && skipped.length) {
-            msg += ` 另有 ${skipped.length} 條因為你手動改過、為避免蓋掉而跳過。`;
+            msg += ` 另有 ${skipped.length} 條因為可能手動改過或來自舊版、為避免蓋掉而跳過。`;
         }
         toast('success', msg);
         refreshBookSelect();
@@ -618,11 +666,15 @@ async function runGraduateFlow() {
     }
 }
 
-/** 省錢模式：原文照搬（content=summaryText，無關鍵字，標題取背景）。 */
+/** 省錢模式：原文照搬，並沿用 Horae 已知的人名／地點／實體名作基礎關鍵字。 */
 function passthroughEntry(summary) {
     const bg = summary.background || {};
     const firstLine = summary.summaryText.split(/[\n。.!?！？]/)[0].slice(0, 30);
-    return { title: firstLine || (bg.location || '歷史片段'), content: summary.summaryText, keywords: [] };
+    return {
+        title: firstLine || (bg.location || '歷史片段'),
+        content: summary.summaryText,
+        keywords: Array.isArray(summary.defaultKeywords) ? summary.defaultKeywords.slice(0, 8) : [],
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -639,7 +691,13 @@ async function pickSummariesPopup(summaries, s) {
     wrap.className = 'hmg-popup';
     const intro = document.createElement('div');
     intro.className = 'hmg-intro';
-    intro.textContent = `共 ${summaries.length} 條可畢業的歷史摘要。預設勾選最舊的 ${oldestN} 條（單次上限 ${maxEntries} 條）。勾選你要畢業的：`;
+    const counts = countHoraeCandidateTypes(summaries);
+    const countText = [
+        counts.event ? `重要事件 ${counts.event}` : '', counts.summary ? `壓縮摘要 ${counts.summary}` : '',
+        counts.location ? `永久場景 ${counts.location}` : '', counts.character ? `角色 ${counts.character}` : '',
+        counts.item ? `重要物品 ${counts.item}` : '', counts.relationship ? `關係 ${counts.relationship}` : '',
+    ].filter(Boolean).join('、');
+    intro.textContent = `共 ${summaries.length} 條可畢業資料（${countText}）。預設勾選前 ${oldestN} 條（單次上限 ${maxEntries} 條）：`;
     wrap.appendChild(intro);
 
     const listEl = document.createElement('div');
@@ -657,8 +715,10 @@ async function pickSummariesPopup(summaries, s) {
         const head = document.createElement('div');
         head.className = 'hmg-row-head';
         const bg = sum.background || {};
+        const typeNames = { event: '重要事件', summary: '壓縮摘要', location: '永久場景', character: '角色資料', item: '重要物品', relationship: '關係資料' };
         const where = [bg.storyDate, bg.location ? `@${bg.location}` : ''].filter(Boolean).join(' ');
-        head.textContent = `${where || '（無背景標記）'}　·　距聊天底部約 ${Number.isFinite(sum.distanceFromBottom) ? sum.distanceFromBottom : '?'} 樓`;
+        const distance = sum.maxIdx >= 0 ? `　·　距聊天底部約 ${sum.distanceFromBottom} 樓` : '';
+        head.textContent = `${typeNames[sum.type] || '記憶'}｜${sum.importance || ''}${where ? `　·　${where}` : ''}${distance}`;
         const prev = document.createElement('div');
         prev.className = 'hmg-row-prev';
         prev.textContent = sum.summaryText.slice(0, 140) + (sum.summaryText.length > 140 ? '…' : '');
@@ -681,7 +741,7 @@ async function pickSummariesPopup(summaries, s) {
         chosen.push(summaries[Number(cb.dataset.idx)]);
     });
     if (chosen.length > maxEntries) {
-        toast('warning', `一次最多 ${maxEntries} 條，只取前 ${maxEntries} 條（最舊的）。`);
+        toast('warning', `一次最多 ${maxEntries} 條，只取排序最前的 ${maxEntries} 條。`);
         return chosen.slice(0, maxEntries);
     }
     return chosen;
@@ -695,7 +755,7 @@ async function confirmEntriesPopup(items, s, useSubApi) {
     const intro = document.createElement('div');
     intro.className = 'hmg-intro';
     intro.textContent = useSubApi
-        ? `Sub API 整理完成，共 ${items.length} 條。確認/修改後寫入世界書「${s.targetBook || '（未選）'}」：`
+        ? `Sub API 整理完成，共 ${items.length} 條。確認/修改後寫入世界書「${s.targetBook || '（未選）'}」；有關鍵字條目的藍燈會在寫入時依全書最新 N 條重整：`
         : `省錢模式（原文照搬）共 ${items.length} 條。確認後寫入世界書「${s.targetBook || '（未選）'}」：`;
     wrap.appendChild(intro);
 
@@ -714,7 +774,10 @@ async function confirmEntriesPopup(items, s, useSubApi) {
         cb.checked = true;
         const badge = document.createElement('span');
         badge.className = 'hmg-badge';
-        badge.textContent = it.isConstant ? '藍燈常駐' : '關鍵字觸發';
+        const noKeywords = !(it.entry.keywords && it.entry.keywords.length);
+        badge.textContent = it.summary.action === 'delete'
+            ? '來源已刪除：確認後移除世界書條目'
+            : (noKeywords ? '藍燈常駐' : (it.isConstant ? '藍燈候選' : '關鍵字觸發'));
         top.appendChild(cb);
         top.appendChild(badge);
         card.appendChild(top);
@@ -758,25 +821,27 @@ async function confirmEntriesPopup(items, s, useSubApi) {
 }
 
 // ---------------------------------------------------------------------------
-// 除錯：印出最新 autoSummaries + save→load 往返驗證標記是否存活
+// 除錯：印出所有 Horae 候選 + save→load 往返驗證標記是否存活
 // ---------------------------------------------------------------------------
 
 async function runDebug() {
     const ctx = getCtx();
     if (!ctx) { toast('error', '拿不到 context'); return; }
 
-    const meta = getHoraeMeta();
-    const list = Array.isArray(meta?.autoSummaries) ? meta.autoSummaries : [];
+    const list = getHoraeChat().flatMap((message) =>
+        Array.isArray(message?.horae_meta?.autoSummaries) ? message.horae_meta.autoSummaries : []);
+    const candidates = getGraduatableSummaries();
     console.log(`${LOG} === DEBUG ===`);
-    console.log(`${LOG} Horae 可用：${horaeAvailable()}；autoSummaries 數量：${list.length}`);
+    console.log(`${LOG} Horae 可用：${horaeAvailable()}；候選統計：`, countHoraeCandidateTypes(candidates));
+    console.log(`${LOG} autoSummaries 數量：${list.length}`);
     if (list.length) console.log(`${LOG} 第一條 autoSummaries 原貌：`, structuredClone(list[0]));
-    console.log(`${LOG} 整理後可畢業清單：`, getGraduatableSummaries());
+    console.log(`${LOG} 整理後可畢業清單：`, candidates);
 
     // save→load 往返：寫一條測試條目到目標書（或臨時書），看標記哪種存活
     const s = getSettings();
     const book = s.targetBook;
     if (!book) {
-        toast('info', '已把 autoSummaries 印到 Console（F12）。設定目標世界書後再跑一次可做 save→load 往返測試。');
+        toast('info', '已把 Horae 事件／摘要／永久資料候選印到 Console（F12）。設定目標世界書後可做 save→load 測試。');
         return;
     }
     try {
@@ -840,12 +905,20 @@ function buildPanel() {
 
                 <div class="hmg-grid">
                     <div>
-                        <label for="${MODULE_NAME}_oldestN">預設勾選最舊 N 條</label>
+                        <label for="${MODULE_NAME}_oldestN">預設勾選前 N 條</label>
                         <input id="${MODULE_NAME}_oldestN" type="number" class="text_pole" min="0" max="50" />
                     </div>
                     <div>
                         <label for="${MODULE_NAME}_maxEntries">單次上限</label>
                         <input id="${MODULE_NAME}_maxEntries" type="number" class="text_pole" min="1" max="50" />
+                    </div>
+                    <div>
+                        <label for="${MODULE_NAME}_maxTotalEntries">全書記憶上限</label>
+                        <input id="${MODULE_NAME}_maxTotalEntries" type="number" class="text_pole" min="10" max="300" />
+                    </div>
+                    <div>
+                        <label for="${MODULE_NAME}_minEventDistance">事件距底部至少 N 樓</label>
+                        <input id="${MODULE_NAME}_minEventDistance" type="number" class="text_pole" min="0" max="1000" />
                     </div>
                     <div>
                         <label for="${MODULE_NAME}_constantCount">藍燈常駐條數</label>
@@ -858,7 +931,7 @@ function buildPanel() {
                     <button id="${MODULE_NAME}_graduate" class="menu_button menu_button_icon">
                         <i class="fa-solid fa-graduation-cap"></i><span>畢業歷史記憶到世界書</span>
                     </button>
-                    <button id="${MODULE_NAME}_debug" class="menu_button" title="印出最新 autoSummaries 並做 save→load 往返測試">除錯</button>
+                    <button id="${MODULE_NAME}_debug" class="menu_button" title="印出 Horae 可畢業候選並做 save→load 往返測試">除錯</button>
                 </div>
                 <div class="hmg-status" id="${MODULE_NAME}_status"></div>
             </div>
@@ -907,6 +980,11 @@ function updateStatus() {
     const caps = checkCapabilities(getCtx());
     const parts = [];
     parts.push(`Horae：${horaeAvailable() ? '可讀' : '此聊天讀不到'}`);
+    if (horaeAvailable()) {
+        const counts = countHoraeCandidateTypes(getGraduatableSummaries());
+        const permanent = (counts.location || 0) + (counts.character || 0) + (counts.item || 0) + (counts.relationship || 0);
+        parts.push(`候選：事件 ${counts.event || 0}／摘要 ${counts.summary || 0}／永久資料 ${permanent}`);
+    }
     parts.push(`核心 API：${caps.ok ? '齊全' : '缺 ' + caps.missing.join('/')}`);
     el.textContent = parts.join('　·　');
 }
@@ -937,10 +1015,11 @@ function bindPanel() {
         const name = await ctx.callGenericPopup('新世界書的名稱：', ctx.POPUP_TYPE.INPUT, '');
         if (typeof name !== 'string' || !name.trim()) return;
         try {
-            await ensureBookExists(ctx, name.trim());
-            getSettings().targetBook = name.trim(); saveSettings();
+            const createdName = await createBookSafely(name.trim());
+            if (!createdName) return;
+            getSettings().targetBook = createdName; saveSettings();
             refreshBookSelect();
-            toast('success', `已新建世界書「${name.trim()}」並設為目標`);
+            toast('success', `已新建世界書「${createdName}」並設為目標`);
         } catch (err) { toast('error', `新建失敗：${err?.message || err}`); }
     });
 
@@ -948,15 +1027,16 @@ function bindPanel() {
         const el = document.getElementById(`${MODULE_NAME}_${id}`);
         el.value = s[key];
         el.addEventListener('change', () => {
-            // 用 isFinite 判斷，讓合法的 0 能保存（不要用 Number(x)||default，那會把 0 改回預設）
-            const n = Number(el.value);
-            getSettings()[key] = Number.isFinite(n) && n >= 0 ? n : defaultSettings[key];
+            const { min, max } = integerSettingBounds[key];
+            getSettings()[key] = normalizeIntegerSetting(el.value, defaultSettings[key], min, max);
             el.value = getSettings()[key]; // 非法輸入時把 UI 拉回有效值
             saveSettings();
         });
     };
     numBind('oldestN', 'oldestN');
     numBind('maxEntries', 'maxEntries');
+    numBind('maxTotalEntries', 'maxTotalEntries');
+    numBind('minEventDistance', 'minEventDistance');
     numBind('constantCount', 'constantCount');
 
     document.getElementById(`${MODULE_NAME}_graduate`).addEventListener('click', (e) => { e.preventDefault(); runGraduateFlow(); });
@@ -973,12 +1053,12 @@ function registerSlash(ctx) {
     try {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'hmg-graduate',
-            helpString: '<div>打開「Horae 記憶畢業到世界書」的預覽流程（選摘要 → 整理 → 確認 → 寫入）。</div>',
+            helpString: '<div>打開預覽流程（選重要事件／永久資料 → 整理 → 確認 → 寫入）。</div>',
             callback: () => { runGraduateFlow(); return ''; },
         }));
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'hmg-debug',
-            helpString: '<div>印出最新 autoSummaries 並做世界書 save→load 往返測試（結果看 Console / F12）。</div>',
+            helpString: '<div>印出 Horae 可畢業候選並做世界書 save→load 往返測試（結果看 Console / F12）。</div>',
             callback: () => { runDebug(); return ''; },
         }));
     } catch (err) {
